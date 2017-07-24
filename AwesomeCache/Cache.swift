@@ -41,7 +41,7 @@ open class Cache<T: NSCoding> {
     public init(name: String, directory: URL?, fileProtection: String? = nil) throws {
         self.name = name
         cache.name = name
-
+        
         if let d = directory {
             cacheDirectory = d
         } else {
@@ -85,12 +85,12 @@ open class Cache<T: NSCoding> {
     ///                         The supplied success or failure blocks must be called upon completion.
     ///                         If the error block is called, the object is not cached and the completion block is invoked with this error.
     /// - parameter completion: Called as soon as a cached object is available to use. The second parameter is true if the object was already cached.
-    open func setObject(forKey key: String, cacheBlock: (@escaping CacheBlockClosure, @escaping ErrorClosure) -> Void, completion: @escaping (T?, Bool, NSError?) -> Void) {
+    open func setObject(forKey key: String, cacheBlock: (CacheBlockClosure, ErrorClosure) -> Void, completion: @escaping (T?, Bool, NSError?) -> Void) {
         if let object = object(forKey: key) {
             completion(object, true, nil)
         } else {
             let successBlock: CacheBlockClosure = { (obj, expires) in
-                self.setObject(obj, forKey: key, expires: expires)
+                _ = self.setObject(obj, forKey: key, expires: expires)
                 completion(obj, false, nil)
             }
 
@@ -154,13 +154,18 @@ open class Cache<T: NSCoding> {
     /// - parameter object:	The object that should be cached
     /// - parameter forKey:	A key that represents this object in the cache
     /// - parameter expires: The CacheExpiry that indicates when the given object should be expired
-    open func setObject(_ object: T, forKey key: String, expires: CacheExpiry = .never) {
+    open func setObject(_ object: T, forKey key: String, expires: CacheExpiry = .never) -> Int64?  {
         let expiryDate = expiryDateForCacheExpiry(expires)
         let cacheObject = CacheObject(value: object, expiryDate: expiryDate)
-
+        var fileSize: Int64?
+        
         queue.sync(flags: .barrier, execute: {
             self.add(cacheObject, key: key)
-        }) 
+            let path = self.urlForKey(key).path
+            fileSize = getFileSizeFor(path: path)!
+        })
+        
+        return fileSize
     }
 
     // MARK: Remove objects
@@ -168,12 +173,14 @@ open class Cache<T: NSCoding> {
     /// Removes an object from the cache.
     ///
     /// - parameter key: The key of the object that should be removed
-    open func removeObject(forKey key: String) {
+    open func removeObject(forKey key: String) -> Int64? {
+        let fileSize: Int64? = getFileSizeFor(path: urlForKey(key).path)
         cache.removeObject(forKey: key as NSString)
 
         queue.sync(flags: .barrier, execute: {
             self.removeFromDisk(key)
-        }) 
+        })
+        return fileSize
     }
 
     /// Removes all objects from the cache.
@@ -187,18 +194,30 @@ open class Cache<T: NSCoding> {
     }
 
     /// Removes all expired objects from the cache.
-    open func removeExpiredObjects() {
+    open func removeExpiredObjects(mightRemove: (AnyObject, (_ forced: Bool) -> ()) -> ()) -> Int64 {
+        var totalFileSize: Int64 = 0
         queue.sync(flags: .barrier, execute: {
             let keys = self.allKeys()
-
+            
             for key in keys {
-                let possibleObject = self.read(key)
-                if let object = possibleObject , object.isExpired() {
-                    self.cache.removeObject(forKey: key as NSString)
-                    self.removeFromDisk(key)
+                let path = self.urlForKey(key).path
+                totalFileSize += getFileSizeFor(path: path)!
+                
+                if let possibleObject = self.read(key) {
+                    let completion: (Bool) -> () = {
+                        forcedRemove in
+                        if possibleObject.isExpired() || forcedRemove {
+                            
+                            self.cache.removeObject(forKey: key as NSString)
+                            self.removeFromDisk(key)
+                        }
+                    }
+                    
+                    mightRemove(possibleObject.value, completion)
                 }
             }
-        }) 
+        })
+        return totalFileSize
     }
 
     // MARK: Subscripting
@@ -209,9 +228,9 @@ open class Cache<T: NSCoding> {
         }
         set(newValue) {
             if let value = newValue {
-                setObject(value, forKey: key)
+                _ = setObject(value, forKey: key)
             } else {
-                removeObject(forKey: key)
+                _ = removeObject(forKey: key)
             }
         }
     }
@@ -221,12 +240,12 @@ open class Cache<T: NSCoding> {
     fileprivate func add(_ object: CacheObject, key: String) {
         // Set object in local cache
         cache.setObject(object, forKey: key as NSString)
-
+        
         // Write object to disk
         let path = urlForKey(key).path
         NSKeyedArchiver.archiveRootObject(object, toFile: path)
     }
-
+    
     fileprivate func read(_ key: String) -> CacheObject? {
         // Check if object exists in local cache
         if let object = cache.object(forKey: key as NSString) {
@@ -236,10 +255,34 @@ open class Cache<T: NSCoding> {
         // Otherwise, read from disk
         let path = urlForKey(key).path
         if fileManager.fileExists(atPath: path) {
-            return _awesomeCache_unarchiveObjectSafely(path) as? CacheObject
+            return _awesomeCache_unarchiveObjectSafely(path: path) as? CacheObject
         }
 
         return nil
+    }
+    
+    func _awesomeCache_unarchiveObjectSafely(path: String) -> NSObject? {
+        return NSKeyedUnarchiver.unarchiveObject(withFile: path) as? NSObject
+    }
+
+    
+    fileprivate func getFileSizeFor(path: String) -> Int64? {
+        do {
+            let attr = try fileManager.attributesOfItem(atPath: path)
+            let fileSize = attr[FileAttributeKey.size] as! Int64
+            return fileSize
+        } catch { return nil }
+    }
+    
+    fileprivate func convertToFileString(with size: UInt64) -> String {
+        var convertedValue: Double = Double(size)
+        var multiplyFactor = 0
+        let tokens = ["bytes", "KB", "MB", "GB", "TB", "PB",  "EB",  "ZB", "YB"]
+        while convertedValue > 1024 {
+            convertedValue /= 1024
+            multiplyFactor += 1
+        }
+        return String(format: "%4.2f %@", convertedValue, tokens[multiplyFactor])
     }
 
     // Deletes an object from disk
