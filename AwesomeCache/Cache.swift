@@ -203,17 +203,22 @@ open class Cache<T: NSCoding> {
                 let path = self.urlForKey(key).path
                 totalFileSize += getFileSizeFor(path: path)!
                 
-                if let possibleObject = self.read(key) {
-                    let completion: (Bool) -> () = {
-                        forcedRemove in
-                        if possibleObject.isExpired() || forcedRemove {
-                            
-                            self.cache.removeObject(forKey: key as NSString)
-                            self.removeFromDisk(key)
+                autoreleasepool {
+                    if let possibleObject = self.read(key) {
+                        let completion: (Bool) -> () = {
+                            forcedRemove in
+                            if possibleObject.isExpired() || forcedRemove {
+                                
+                                self.cache.removeObject(forKey: key as NSString)
+                                self.removeFromDisk(key)
+                            }
                         }
+                        
+                        mightRemove(possibleObject.value, completion)
+                    } else {
+                        self.cache.removeObject(forKey: key as NSString)
+                        self.removeFromDisk(key)
                     }
-                    
-                    mightRemove(possibleObject.value, completion)
                 }
             }
         })
